@@ -3,9 +3,10 @@ FQBN      ?= arduino:avr:mega:cpu=atmega2560
 PORT      ?= /dev/ttyACM0
 BAUD      ?= 115200
 DEBUG     ?= 0
+REPEAT    ?= 0
 BUILD_DIR := build
 
-CFLAGS := -DSERIAL_BAUD=$(BAUD)UL -DIR_DEBUG=$(DEBUG)
+CFLAGS := -DSERIAL_BAUD=$(BAUD)UL -DIR_DEBUG=$(DEBUG) -DIR_SHOW_REPEATS=$(REPEAT)
 
 .PHONY: build upload monitor clean
 

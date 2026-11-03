@@ -27,6 +27,11 @@
 #define IR_DEBUG 0
 #endif
 
+/* 1: print auto-repeats, indented under the key they repeat (make REPEAT=1) */
+#ifndef IR_SHOW_REPEATS
+#define IR_SHOW_REPEATS 0
+#endif
+
 /* USART0 is wired to the USB-serial bridge on the Mega2560 */
 #ifndef SERIAL_BAUD
 #define SERIAL_BAUD 115200UL
@@ -37,12 +42,15 @@
 enum ir_protocol {
     IR_PROTO_NEC,        /* 32 bits, 38 kHz */
     IR_PROTO_KASEIKYO,   /* 48 bits, ~37 kHz: Panasonic, Denon, JVC, ... */
+    IR_PROTO_RC5,        /* 14 bits, 36 kHz, bi-phase: Philips, Arcam, ... */
 };
 
 struct ir_code {
     enum ir_protocol protocol;
-    uint8_t          len;                 /* bytes used in data[] */
-    uint8_t          data[IR_MAX_BYTES];  /* in transmit order, LSB-first bytes */
+    uint8_t          len;                 /* bytes used in data[]; 0 for NEC repeat code */
+    uint8_t          data[IR_MAX_BYTES];  /* NEC/Kaseikyo: frame bytes in transmit order;
+                                             RC5: addr, cmd (bit 6 = !S2), toggle */
+    bool             repeat;              /* same key as the previous code */
 };
 
 #ifdef __cplusplus

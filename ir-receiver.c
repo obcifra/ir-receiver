@@ -115,10 +115,11 @@ static uint8_t reverse_bits(uint8_t b)
  * Typical IR receiver modules (AX-1838HS, VS1838B, TSOP38xx) output LOW
  * while a carrier burst ("mark") is present and HIGH otherwise ("space").
  *
- * Both supported protocols are pulse-distance coded:
+ * NEC and Kaseikyo are pulse-distance coded:
  *   header mark, header space, N x (bit mark + short/long space), stop mark
  * Bits are sent LSB first. The protocol is chosen from the header mark
  * length, then the rest of the frame is timed against that protocol.
+ * RC-5 is bi-phase coded and has its own decoder (see below).
  *
  *            header         bit mark   "0" space   "1" space   bits
  *   NEC      9000/4500 us   560 us     560 us      1690 us     32
@@ -188,7 +189,10 @@ static bool frame_valid(enum ir_protocol proto, const uint8_t *f)
 
 /* ------------------------------------------------------------ IR core */
 
-enum ir_state { IR_IDLE, IR_LEAD_MARK, IR_LEAD_SPACE, IR_BIT_MARK, IR_BIT_SPACE };
+enum ir_state {
+    IR_IDLE, IR_LEAD_MARK, IR_LEAD_SPACE, IR_BIT_MARK, IR_BIT_SPACE,
+    IR_RC5, IR_RC5_DONE, IR_NEC_RPT
+};
 
 static volatile struct ir_code ir_result;
 static volatile bool           ir_ready;
@@ -310,15 +314,14 @@ static uint32_t ticks_now(uint16_t lo)
     return ((uint32_t)hi << 16) | lo;
 }
 
-/* Publish a complete, valid frame, dropping auto-repeats of the last one. */
-static void ir_publish(enum ir_protocol proto, const uint8_t *frame, uint16_t lo)
+/* Publish a complete, valid frame. Repeats of the last frame are flagged. */
+static void ir_publish(enum ir_protocol proto, const uint8_t *frame, uint8_t len, uint16_t lo)
 {
     static struct ir_code last;
     static uint32_t       last_time;
     static bool           have_last;
 
     uint32_t now = ticks_now(lo);
-    uint8_t  len = timings[proto].nbits / 8;
     bool     repeat = have_last
                    && last.protocol == proto
                    && memcmp(last.data, frame, len) == 0
@@ -330,15 +333,107 @@ static void ir_publish(enum ir_protocol proto, const uint8_t *frame, uint16_t lo
     last_time = now;
     have_last = true;
 
-    if (repeat)
+    if (repeat && !IR_SHOW_REPEATS)
         return;
 
     ir_result.protocol = proto;
     ir_result.len      = len;
+    ir_result.repeat   = repeat;
     for (uint8_t i = 0; i < len; i++)
         ir_result.data[i] = frame[i];
     ir_ready = true;
 }
+
+/* NEC repeat code: 9000/2250 us header, no data. It repeats the last key. */
+static void ir_publish_nec_repeat(void)
+{
+    if (!IR_SHOW_REPEATS)
+        return;
+    ir_result.protocol = IR_PROTO_NEC;
+    ir_result.len      = 0;
+    ir_result.repeat   = true;
+    ir_ready           = true;
+}
+
+/* ---------------------------------------------------------- RC-5 */
+/*
+ * Philips RC-5: 14 bits, bi-phase (Manchester) coded, MSB first, 36 kHz.
+ * Each bit is two 889 us half-bits. A "1" is space-then-mark and a "0" is
+ * mark-then-space, so the level of the second half-bit is the bit value.
+ * Frame: S1 S2 T A4..A0 C5..C0
+ *   S1 start bit (always 1), S2 = inverted command bit 6 (extended RC-5),
+ *   T  toggle (flips on each new key press), A address, C command.
+ *
+ * A run of one level lasts 1 or 2 half-bits. Each run is checked when it
+ * ends, and a run that starts on a second half-bit carries a bit.
+ */
+#define RC5_HALF_MIN  US(600)
+#define RC5_HALF_MAX  US(1200)
+#define RC5_FULL_MIN  US(1400)
+#define RC5_FULL_MAX  US(2200)
+
+static uint16_t rc5_word;
+static uint8_t  rc5_nbits;
+static uint8_t  rc5_phase;   /* 1: the current run starts on a second half-bit */
+
+/* Half-bits in a run of d ticks (1 or 2); 0 if not an RC-5 run. */
+static uint8_t rc5_halves(uint16_t d)
+{
+    if (between(d, RC5_HALF_MIN, RC5_HALF_MAX))
+        return 1;
+    if (between(d, RC5_FULL_MIN, RC5_FULL_MAX))
+        return 2;
+    return 0;
+}
+
+/* Close the run that just ended (length d), then start a run at level low.
+ * Returns 1 when 14 bits are complete, -1 on a framing error, else 0. */
+static int rc5_edge(bool low, uint16_t d)
+{
+    uint8_t n = rc5_halves(d);
+
+    /* A 2-half run must begin on a second half-bit, otherwise a level
+     * would last across a whole bit, which RC-5 never does. */
+    if (n == 0 || (n == 2 && rc5_phase == 0))
+        return -1;
+    rc5_phase = (rc5_phase + n) & 1;
+
+    if (rc5_phase == 1) {
+        rc5_word = (rc5_word << 1) | (low ? 1 : 0);
+        if (++rc5_nbits == 14)
+            return 1;
+    }
+    return 0;
+}
+
+/* Called on the rising edge that ends the start bit S1's mark. */
+static void rc5_begin(void)
+{
+    rc5_word  = 1;   /* S1 */
+    rc5_nbits = 1;
+    rc5_phase = 1;   /* the mark ending now began on S1's second half-bit */
+}
+
+/* Advance the RC-5 decoder by one run. Returns the next ir_state. */
+static enum ir_state rc5_step(bool low, uint16_t d, uint16_t now)
+{
+    uint8_t f[3];
+    int     r = rc5_edge(low, d);
+
+    if (r < 0)
+        return IR_IDLE;
+    if (r == 0)
+        return IR_RC5;
+
+    f[0] = (rc5_word >> 6) & 0x1F;                                /* address */
+    f[1] = (rc5_word & 0x3F) | ((rc5_word & 0x1000) ? 0 : 0x40); /* command */
+    f[2] = (rc5_word >> 11) & 1;                                  /* toggle  */
+    ir_publish(IR_PROTO_RC5, f, 3, now);
+    return IR_RC5_DONE;
+}
+
+#define NEC_RPT_SPACE_LO  US(2000)   /* NEC repeat header space: 2250 us */
+#define NEC_RPT_SPACE_HI  US(2500)
 
 ISR(PCINT0_vect)
 {
@@ -364,6 +459,17 @@ ISR(PCINT0_vect)
     raw_push(d, !low);
 #endif
 
+    if (state == IR_RC5) {
+        state = rc5_step(low, d, now);
+        if (state != IR_IDLE)
+            return;
+    }
+    if (state == IR_RC5_DONE) {
+        if (d <= RC5_FULL_MAX)
+            return;          /* still in the frame's idle tail */
+        state = IR_IDLE;     /* fall through: this edge may start a frame */
+    }
+
     if (low) {
         /* Falling edge: a space just ended. */
         switch (state) {
@@ -374,7 +480,11 @@ ISR(PCINT0_vect)
                 state = IR_BIT_MARK;
                 return;
             }
-            break;   /* includes NEC 2250us repeat header: ignored */
+            if (proto == IR_PROTO_NEC && between(d, NEC_RPT_SPACE_LO, NEC_RPT_SPACE_HI)) {
+                state = IR_NEC_RPT;   /* repeat code: confirmed by its stop mark */
+                return;
+            }
+            break;
         case IR_BIT_SPACE:
             if (between(d, t->space_lo, t->space_hi)) {
                 if (d > t->one_threshold)
@@ -401,6 +511,15 @@ ISR(PCINT0_vect)
                     break;
                 }
             }
+            if (state == IR_IDLE && rc5_halves(d)) {
+                rc5_begin();
+                state = rc5_step(false, d, now);
+            }
+            break;
+        case IR_NEC_RPT:
+            if (between(d, t->mark_lo, t->mark_hi))
+                ir_publish_nec_repeat();
+            state = IR_IDLE;
             break;
         case IR_BIT_MARK:
             if (!between(d, t->mark_lo, t->mark_hi)) {
@@ -408,7 +527,7 @@ ISR(PCINT0_vect)
             } else if (bits == t->nbits) {
                 /* Stop mark: frame complete. */
                 if (frame_valid(proto, frame))
-                    ir_publish(proto, frame, now);
+                    ir_publish(proto, frame, timings[proto].nbits / 8, now);
                 state = IR_IDLE;
             } else {
                 state = IR_BIT_SPACE;
@@ -430,6 +549,7 @@ bool ir_read(struct ir_code *code)
         if (ir_ready) {
             code->protocol = ir_result.protocol;
             code->len      = ir_result.len;
+            code->repeat   = ir_result.repeat;
             for (uint8_t i = 0; i < ir_result.len; i++)
                 code->data[i] = ir_result.data[i];
             ir_ready = false;
@@ -444,6 +564,7 @@ bool ir_read(struct ir_code *code)
  *   NEC addr=0x00 cmd=0x46 raw=0x00FF629D
  *   PANASONIC addr=0x... cmd=0x.. raw=0x0220........
  *   KASEIKYO vendor=0x0003 addr=0x... cmd=0x.. raw=0x...
+ *   RC5 addr=0x05 cmd=0x0C toggle=0 raw=0x314C
  *
  * addr/cmd follow the IRremote library conventions so codes can be
  * compared against published tables.
@@ -455,6 +576,10 @@ void ir_format(const struct ir_code *code, char *buf)
 
     switch (code->protocol) {
     case IR_PROTO_NEC: {
+        if (code->len == 0) {
+            p = put_str(p, "NEC repeat code");
+            break;
+        }
         /* raw: classic MSB-first value, e.g. 0x00FF629D */
         uint32_t raw = (uint32_t)reverse_bits(f[0]) << 24
                      | (uint32_t)reverse_bits(f[1]) << 16
@@ -469,6 +594,24 @@ void ir_format(const struct ir_code *code, char *buf)
         p = put_hex(p, f[2], 2);
         p = put_str(p, " raw=");
         p = put_hex(p, raw, 8);
+        break;
+    }
+    case IR_PROTO_RC5: {
+        /* raw: the 14-bit frame as received, S1 S2 T A4..A0 C5..C0 */
+        uint16_t raw = (1u << 13)                          /* S1 */
+                     | (f[1] & 0x40 ? 0 : 1u << 12)        /* S2 = !cmd bit 6 */
+                     | (uint16_t)f[2] << 11                /* toggle */
+                     | (uint16_t)f[0] << 6                 /* address */
+                     | (f[1] & 0x3F);                      /* command */
+
+        p = put_str(p, "RC5 addr=");
+        p = put_hex(p, f[0], 2);
+        p = put_str(p, " cmd=");
+        p = put_hex(p, f[1], 2);
+        p = put_str(p, " toggle=");
+        *p++ = '0' + f[2];
+        p = put_str(p, " raw=");
+        p = put_hex(p, raw, 4);
         break;
     }
     case IR_PROTO_KASEIKYO: {
@@ -499,8 +642,9 @@ void ir_format(const struct ir_code *code, char *buf)
 /* Overrides the Arduino core main(); the core's main.o is not linked in. */
 int main(void)
 {
-    struct ir_code code;
-    char           buf[72];
+    struct ir_code code, last;
+    bool           have_last = false;
+    char           buf[72], last_buf[72];
 
     led_init();
     serial_init();
@@ -538,11 +682,25 @@ int main(void)
             ir_format(&code, buf);
 #if IR_DEBUG
             serial_out("");
-            serial_out(buf);
-#else
-            serial_out(buf);
-            led_blink();
 #endif
+            if (!code.repeat) {
+                last      = code;
+                have_last = true;
+                serial_out(buf);
+#if !IR_DEBUG
+                led_blink();
+#endif
+            } else {
+                /* Indented: same key as the line above it. */
+                serial_write("    ");
+                serial_write(buf);
+                if (code.len == 0 && have_last) {
+                    ir_format(&last, last_buf);
+                    serial_write(" of ");
+                    serial_write(last_buf);
+                }
+                serial_out("");
+            }
         }
     }
 
