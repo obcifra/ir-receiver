@@ -48,6 +48,10 @@ PROTOCOL_INFO = {
 
 SEPARATOR = "|"
 
+# Colours cycled per field, so each field's bits share one colour.
+ANSI_COLORS = ["31", "32", "33", "34", "35", "36"]
+ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
 
 @dataclass
 class Field:
@@ -160,14 +164,60 @@ def make_frame(line: str, when: dt.datetime) -> Frame | None:
 
 # ------------------------------------------------------------- drawing
 
+def bit_owners(frame: Frame) -> list[list[int | None]]:
+    """For each raw byte, the field index owning each of its 8 bits (MSB first).
+    None marks padding bits that belong to no field."""
+    if frame.protocol == "NEC":
+        if len(frame.fields) == 4:                       # 8-bit address
+            return [[0] * 8, [1] * 8, [2] * 8, [3] * 8]
+        return [[0] * 8, [0] * 8, [1] * 8, [2] * 8]      # 16-bit address
+    if frame.protocol in ("PANASONIC", "KASEIKYO"):
+        # byte 2 is vparity (low nibble) then address (high nibble)
+        return [[0] * 8, [0] * 8, [2] * 4 + [1] * 4, [2] * 8, [3] * 8, [4] * 8]
+    # RC-5: 14 bits in two bytes, so the top two bits are padding
+    return [[None, None, 0, 1, 2, 3, 3, 3], [3, 3, 4, 4, 4, 4, 4, 4]]
+
+
+def paint(text: str, index: int) -> str:
+    """Colour text with the colour of field `index`."""
+    color = ANSI_COLORS[index % len(ANSI_COLORS)]
+    return f"\033[{color}m{text}\033[0m"
+
+
+def colored_bits(frame: Frame) -> list[str]:
+    """Each raw byte as 8 binary digits, each digit coloured by its field."""
+    cells = []
+    for i, owners in zip(range(0, len(frame.raw), 2), bit_owners(frame)):
+        value = int(frame.raw[i:i + 2], 16)
+        digits = []
+        for bit, owner in zip(f"{value:08b}", owners):
+            if owner is None:
+                digits.append(bit)
+            else:
+                digits.append(paint(bit, owner))
+        cells.append("".join(digits))
+    return cells
+
+
+def visible_len(text: str) -> int:
+    return len(ANSI_RE.sub("", text))
+
+
+def center_cell(cell: str, width: int) -> str:
+    """Centre text that may contain colour codes (same split as str.center)."""
+    marg = width - visible_len(cell)
+    left = marg // 2 + (marg & width & 1)
+    return " " * left + cell + " " * (marg - left)
+
+
 def center_table(rows: list[tuple[str, list[str]]]) -> list[str]:
     """Rows of cells, columns separated by SEPARATOR, each cell centred."""
     ncol = len(rows[0][1])
-    widths = [max(len(cells[i]) for _, cells in rows) + 2 for i in range(ncol)]
+    widths = [max(visible_len(cells[i]) for _, cells in rows) + 2 for i in range(ncol)]
     label_w = max(len(name) for name, _ in rows)
     out = []
     for name, cells in rows:
-        body = SEPARATOR.join(c.center(w) for c, w in zip(cells, widths))
+        body = SEPARATOR.join(center_cell(c, w) for c, w in zip(cells, widths))
         out.append(f"{name.ljust(label_w)}  {body}")
     return out
 
@@ -190,18 +240,20 @@ def render_frame(frame: Frame) -> list[str]:
     # Raw value split into bytes. RC-5 is 14 bits, so its two bytes
     # include two leading zero bits.
     bytes_row = [frame.raw[i:i + 2] for i in range(0, len(frame.raw), 2)]
-    out += center_table([("Bytes", bytes_row)])
+    out += center_table([("Bytes", bytes_row), ("Bits", colored_bits(frame))])
     out.append("")
     out += center_table([
-        ("Field", [f.label for f in frame.fields]),
-        ("Hex", [f.hex for f in frame.fields]),
-        ("Binary", [f.bits for f in frame.fields]),
+        ("Field", [paint(f.label, i) for i, f in enumerate(frame.fields)]),
+        ("Hex", [paint(f.hex, i) for i, f in enumerate(frame.fields)]),
+        ("Binary", [paint(f.bits, i) for i, f in enumerate(frame.fields)]),
     ])
 
     width = max(len(f.label) for f in frame.fields)
     out += ["", "Details:"]
-    for f in frame.fields:
-        out.append(f"  {f.label.ljust(width)}  0x{f.hex:<5} {f.meaning}")
+    for i, f in enumerate(frame.fields):
+        label = paint(f.label.ljust(width), i)
+        hexval = paint(f"0x{f.hex:<5}", i)
+        out.append(f"  {label}  {hexval} {f.meaning}")
 
     if frame.checks:
         out += ["", "Checks:"]
